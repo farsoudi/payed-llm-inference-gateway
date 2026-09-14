@@ -96,7 +96,7 @@ func (s *Service) Protect(amount int64, description string, next func(Settlement
 			return
 		}
 		payer := settled.Payer
-		if payer == "" && verified != nil {
+		if payer == "" {
 			payer = verified.Payer
 		}
 		network := settled.Network

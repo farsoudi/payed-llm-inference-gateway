@@ -94,7 +94,7 @@ curl -N http://localhost:8080/v1/chat/completions \
 
 The gateway pins billable requests to the configured Ollama model and applies
 the configured generation safety ceiling (`num_predict` for native requests and
-the relevant `max_*_tokens` field for OpenAI-compatible requests). Native
+`max_tokens`/`max_output_tokens` for OpenAI-compatible requests). Native
 generation remains Ollama NDJSON. OpenAI-compatible generation remains SSE.
 Before calling Ollama, the gateway reserves enough local balance for the capped
 output limit. It bills exact reported usage at completion and releases the

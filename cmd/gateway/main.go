@@ -48,7 +48,7 @@ func serve(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fs.String("config", "", "path to KEY=VALUE configuration file")
 	_ = fs.Parse(args)
-	cfg, err :=  config.Load(*configPath)
+	cfg, err := config.Load(*configPath)
 	fatalIf(err)
 	fatalIf(cfg.Validate())
 	openCtx, openCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -93,7 +93,7 @@ func userCommand(args []string) {
 }
 
 func addUser(args []string) {
-	fs := adminFlags("user add", args)
+	fs := adminFlags("user add")
 	label := fs.String("label", "", "human-readable label")
 	rate := fs.Int("rate", 0, "requests per minute (defaults to config)")
 	concurrency := fs.Int("concurrency", 0, "maximum concurrent requests (defaults to config)")
@@ -119,7 +119,7 @@ func addUser(args []string) {
 }
 
 func listUsers(args []string) {
-	fs := adminFlags("user list", args)
+	fs := adminFlags("user list")
 	_ = fs.Parse(args)
 	_, store := adminStore(fs)
 	defer store.Close()
@@ -131,10 +131,8 @@ func listUsers(args []string) {
 }
 
 func revokeUser(args []string) {
-	fs := adminFlags("user revoke", args)
-	key := fs.String("key", "", "API key to revoke")
-	keyFile := fs.String("key-file", "", "read the API key from a protected file")
-	keyStdin := fs.Bool("key-stdin", false, "read the API key from stdin")
+	fs := adminFlags("user revoke")
+	key, keyFile, keyStdin := keyFlags(fs)
 	_ = fs.Parse(args)
 	_, store := adminStore(fs)
 	defer store.Close()
@@ -148,10 +146,8 @@ func revokeUser(args []string) {
 }
 
 func limitUser(args []string) {
-	fs := adminFlags("user limit", args)
-	key := fs.String("key", "", "API key")
-	keyFile := fs.String("key-file", "", "read the API key from a protected file")
-	keyStdin := fs.Bool("key-stdin", false, "read the API key from stdin")
+	fs := adminFlags("user limit")
+	key, keyFile, keyStdin := keyFlags(fs)
 	rate := fs.Int("rate", 0, "requests per minute")
 	concurrency := fs.Int("concurrency", 0, "maximum concurrent requests")
 	_ = fs.Parse(args)
@@ -171,10 +167,8 @@ func topupCommand(args []string) {
 		usage()
 		os.Exit(2)
 	}
-	fs := adminFlags("topup reconcile", args[1:])
-	key := fs.String("key", "", "API key")
-	keyFile := fs.String("key-file", "", "read the API key from a protected file")
-	keyStdin := fs.Bool("key-stdin", false, "read the API key from stdin")
+	fs := adminFlags("topup reconcile")
+	key, keyFile, keyStdin := keyFlags(fs)
 	amount := fs.Int64("amount-micro", 0, "top-up amount in micro-USDC")
 	tx := fs.String("transaction", "", "settlement transaction hash")
 	payer := fs.String("payer", "", "payer address from settlement")
@@ -193,10 +187,16 @@ func topupCommand(args []string) {
 	fmt.Printf("reconciled %d micro-USDC on %s\n", *amount, *network)
 }
 
-func adminFlags(name string, args []string) *flag.FlagSet {
+func adminFlags(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	fs.String("config", "", "path to KEY=VALUE configuration file")
 	return fs
+}
+
+func keyFlags(fs *flag.FlagSet) (key, keyFile *string, keyStdin *bool) {
+	return fs.String("key", "", "API key"),
+		fs.String("key-file", "", "read the API key from a protected file"),
+		fs.Bool("key-stdin", false, "read the API key from stdin")
 }
 
 func adminStore(fs *flag.FlagSet) (config.Config, ledger.Store) {

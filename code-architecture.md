@@ -421,8 +421,8 @@ log/alerting system.
 
 `httpapi.New()` constructs:
 
-- One `meter.BalanceCache`.
-- One `meter.Meter` using the configured `Store`.
+- One `meter.Meter` using the configured `Store` and price. The meter owns the
+  `BalanceCache` internally.
 - One guardrail controller.
 - One failure monitor.
 - One Ollama client with the configured URL, model, and timeout.
@@ -598,8 +598,11 @@ generation request.
 
 `Client.PrepareModel()` pins model-only requests such as embeddings without
 adding generation limits. `Client.PrepareCompatible()` preserves the
-OpenAI/Anthropic-compatible body, pins `model`, and caps an existing or
-endpoint-appropriate `max_*_tokens` field without removing other fields.
+OpenAI/Anthropic-compatible body and pins `model`. It derives the limit from the
+endpoint's own field — `max_tokens`, `max_output_tokens` for `/v1/responses`, or
+the `max_completion_tokens` chat alias — clamps it to the safety ceiling, and
+removes the other `max_*` fields so exactly one enforced limit remains. Streamed
+chat/completions requests also get `stream_options.include_usage=true`.
 
 ### HTTP Request
 
@@ -688,9 +691,12 @@ streaming calls `Ollama.StreamSSE()`.
 
 For each event, the callback:
 
-1. Gives the event to `Tracker.Observe()`.
-2. Writes the original raw native event or SSE frame to the client.
+1. Writes the original raw native event or SSE frame to the client.
+2. Records the event with `Tracker.Observe()` only after a complete write.
 3. Flushes the writer when `http.Flusher` is available.
+
+A failed or short write stops the stream so usage that was not delivered is not
+observed.
 
 The HTTP status is intentionally not committed until the first output write.
 This means an Ollama connection failure before any output can still become an
@@ -756,8 +762,8 @@ Each request gets a `Tracker` containing:
 
 ### Reservation
 
-Creating a tracker reserves `max_tokens * PRICE_PER_TOKEN_MICRO` after gateway
-policy caps the request. For embeddings, the request byte length is a
+Creating a tracker reserves `capped_output_limit * PRICE_PER_TOKEN_MICRO` after
+gateway policy caps the request. For embeddings, the request byte length is a
 conservative input-token upper bound. Reservation failure returns HTTP 402
 before Ollama receives the request.
 
@@ -767,29 +773,27 @@ admission or mid-stream stop decisions.
 
 ### Finalization
 
-`Tracker.Finalize()`:
+`Tracker.Finalize(ctx, usage, partial, billInput)`:
 
 1. Uses Ollama `eval_count` when available.
 2. Falls back to the local output estimate for interrupted streams.
 3. Records `prompt_eval_count` for auditability.
-4. Bills generated output tokens only.
+4. Bills generated output tokens, or input tokens when `billInput` is set.
 5. Calls `Store.Debit()` with latency and partial state.
 6. Updates the cache from the durable result and removes the full reservation.
 
 The final cost is:
 
 ```text
-completion_tokens * PRICE_PER_TOKEN_MICRO
+billed_tokens * PRICE_PER_TOKEN_MICRO
 ```
 
-Prompt tokens are recorded but not charged because the project prices the
-expensive generated output rather than prompt ingestion.
-
-`Tracker.FinalizeInput()` is used for embedding endpoints. Embeddings do not
-generate completion text, so their reported input tokens are charged at the
-same configured per-token rate while remaining recorded in `prompt_tokens`.
-This applies to `/api/embed` and `/v1/embeddings`. Legacy `/api/embeddings` is
-proxied without token billing because its response does not report usage.
+For generation, prompt tokens are recorded but not charged because the project
+prices the expensive generated output rather than prompt ingestion. Embedding
+endpoints set `billInput`, so their reported input tokens are charged at the same
+configured per-token rate while remaining recorded in `prompt_tokens`. This
+applies to `/api/embed` and `/v1/embeddings`. Legacy `/api/embeddings` is proxied
+without token billing because its response does not report usage.
 
 ## 17. Insufficient Balance Workflow
 

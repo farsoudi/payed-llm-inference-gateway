@@ -14,7 +14,6 @@ type Controller struct {
 }
 
 type state struct {
-	limits      Limits
 	windowStart time.Time
 	windowCount int
 	active      int
@@ -27,11 +26,8 @@ func (c *Controller) Acquire(ctx context.Context, key string, limits Limits) (fu
 		c.mu.Lock()
 		s := c.states[key]
 		if s == nil {
-			s = &state{limits: limits, windowStart: time.Now()}
+			s = &state{windowStart: time.Now()}
 			c.states[key] = s
-		}
-		if s.limits != limits {
-			s.limits = limits
 		}
 		now := time.Now()
 		if now.Sub(s.windowStart) >= time.Minute {

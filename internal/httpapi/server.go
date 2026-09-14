@@ -36,11 +36,10 @@ type Server struct {
 }
 
 func New(cfg config.Config, store ledger.Store) *Server {
-	cache := meter.NewBalanceCache()
 	s := &Server{
 		Config:   cfg,
 		Store:    store,
-		Meter:    &meter.Meter{Store: store, Cache: cache, Config: cfg},
+		Meter:    meter.New(store, cfg.PricePerTokenMicro),
 		Limits:   guardrails.New(),
 		Failures: guardrails.NewFailureMonitor(),
 		Ollama:   &ollama.Client{BaseURL: cfg.OllamaURL, Model: cfg.OllamaModel, HTTPClient: &http.Client{Timeout: cfg.RequestTimeout}},
@@ -165,7 +164,7 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request, spec inferenc
 	if !ok {
 		return
 	}
-	_, err := s.Meter.PreflightUser(hash, u)
+	err := s.Meter.PreflightUser(hash, u)
 	if err != nil {
 		if errors.Is(err, ledger.ErrInsufficientFunds) {
 			writeError(w, http.StatusPaymentRequired, "top up your balance before requesting inference")
@@ -200,11 +199,12 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request, spec inferenc
 		}
 	}
 	var prepared []byte
-	if spec.protocol != nativeNDJSON && spec.protocol != jsonResponse {
+	switch spec.protocol {
+	case compatibleSSE:
 		prepared, err = s.Ollama.PrepareCompatible(body, spec.endpoint, s.Config.SafetyMaxTokens)
-	} else if spec.protocol == jsonResponse {
+	case jsonResponse:
 		prepared, err = s.Ollama.PrepareModel(body)
-	} else {
+	default:
 		prepared, err = s.Ollama.PrepareNative(body, stream, s.Config.SafetyMaxTokens)
 	}
 	if err != nil {
@@ -229,23 +229,34 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request, spec inferenc
 	defer tracker.Cancel()
 	upstreamRequest := r.WithContext(ctx)
 	if spec.protocol == jsonResponse || !stream {
-		s.jsonInference(w, upstreamRequest, spec, prepared, tracker, hash, spec.billInput)
+		s.jsonInference(w, upstreamRequest, spec, prepared, tracker, hash)
 		return
 	}
 	s.streamInference(w, upstreamRequest, spec, prepared, tracker, hash)
 }
 
-func (s *Server) streamInference(w http.ResponseWriter, r *http.Request, spec inferenceSpec, body []byte, tracker *meter.Tracker, hash string) {
+// upstream sends the prepared request to Ollama. It returns nil after writing an
+// error or redirect response; otherwise the caller must close resp.Body.
+func (s *Server) upstream(w http.ResponseWriter, r *http.Request, spec inferenceSpec, body []byte) *http.Response {
 	resp, err := s.Ollama.Do(r.Context(), r, spec.endpoint, body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
+		return nil
+	}
+	if resp.StatusCode >= 300 {
+		forwardResponse(w, resp)
+		_ = resp.Body.Close()
+		return nil
+	}
+	return resp
+}
+
+func (s *Server) streamInference(w http.ResponseWriter, r *http.Request, spec inferenceSpec, body []byte, tracker *meter.Tracker, hash string) {
+	resp := s.upstream(w, r, spec, body)
+	if resp == nil {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		forwardResponse(w, resp)
-		return
-	}
 	copyResponseHeaders(w.Header(), resp.Header, false)
 	flush, _ := w.(http.Flusher)
 	wrote := false
@@ -264,12 +275,12 @@ func (s *Server) streamInference(w http.ResponseWriter, r *http.Request, spec in
 		}
 		return nil
 	}
-	var result ollama.Result
+	var usage ollama.Event
 	var streamErr error
 	if spec.protocol == nativeNDJSON {
-		result, streamErr = s.Ollama.StreamNDJSON(resp.Body, callback)
+		usage, streamErr = s.Ollama.StreamNDJSON(resp.Body, callback)
 	} else {
-		result, streamErr = s.Ollama.StreamSSE(resp.Body, callback)
+		usage, streamErr = s.Ollama.StreamSSE(resp.Body, callback)
 	}
 	if streamErr != nil {
 		s.Logger.Error("inference stream failed", "error", streamErr, "key", hash)
@@ -278,31 +289,25 @@ func (s *Server) streamInference(w http.ResponseWriter, r *http.Request, spec in
 			return
 		}
 	}
-	if _, _, err := s.finishBilling(tracker, result.Usage, streamErr != nil, spec.billInput); err != nil {
+	if _, _, err := s.finishBilling(tracker, usage, streamErr != nil, spec.billInput); err != nil {
 		s.Logger.Error("billing failed after stream", "error", err, "key", hash)
 	}
 }
 
-func (s *Server) jsonInference(w http.ResponseWriter, r *http.Request, spec inferenceSpec, body []byte, tracker *meter.Tracker, hash string, billInput bool) {
-	resp, err := s.Ollama.Do(r.Context(), r, spec.endpoint, body)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+func (s *Server) jsonInference(w http.ResponseWriter, r *http.Request, spec inferenceSpec, body []byte, tracker *meter.Tracker, hash string) {
+	resp := s.upstream(w, r, spec, body)
+	if resp == nil {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		forwardResponse(w, resp)
-		return
-	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "unable to read Ollama response")
 		return
 	}
 	event := ollama.EventFromJSON(data)
-	event.Done = true
 	tracker.Observe(event)
-	if _, _, err := s.finishBilling(tracker, event, false, billInput); err != nil {
+	if _, _, err := s.finishBilling(tracker, event, false, spec.billInput); err != nil {
 		if errors.Is(err, ledger.ErrInsufficientFunds) {
 			writeError(w, http.StatusPaymentRequired, "insufficient balance for completed inference")
 		} else {
@@ -357,12 +362,7 @@ func forwardResponse(w http.ResponseWriter, resp *http.Response) {
 
 func copyResponseHeaders(dst, src http.Header, contentLength bool) {
 	headers := src.Clone()
-	for _, name := range strings.Split(headers.Get("Connection"), ",") {
-		headers.Del(strings.TrimSpace(name))
-	}
-	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
-		headers.Del(name)
-	}
+	ollama.RemoveHopByHop(headers)
 	if !contentLength {
 		headers.Del("Content-Length")
 	}
@@ -376,10 +376,7 @@ func copyResponseHeaders(dst, src http.Header, contentLength bool) {
 func (s *Server) finishBilling(tracker *meter.Tracker, usage ollama.Event, partial, billInput bool) (int64, int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if billInput {
-		return tracker.FinalizeInput(ctx, usage, partial)
-	}
-	return tracker.Finalize(ctx, usage, partial)
+	return tracker.Finalize(ctx, usage, partial, billInput)
 }
 
 func (s *Server) user(w http.ResponseWriter, r *http.Request) (domain.User, string, bool) {

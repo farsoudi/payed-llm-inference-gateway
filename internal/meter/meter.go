@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/farsoudi/payed-llm-inference/internal/config"
 	"github.com/farsoudi/payed-llm-inference/internal/domain"
 	"github.com/farsoudi/payed-llm-inference/internal/ledger"
 	"github.com/farsoudi/payed-llm-inference/internal/money"
@@ -87,10 +86,14 @@ func (c *BalanceCache) Release(key string, reservation int64) {
 }
 
 type Meter struct {
-	Store  ledger.Store
-	Cache  *BalanceCache
-	Config config.Config
-	locks  sync.Map
+	store ledger.Store
+	cache *BalanceCache
+	price int64
+	locks sync.Map
+}
+
+func New(store ledger.Store, pricePerTokenMicro int64) *Meter {
+	return &Meter{store: store, cache: NewBalanceCache(), price: pricePerTokenMicro}
 }
 
 func (m *Meter) accountLock(keyHash string) *sync.Mutex {
@@ -102,19 +105,18 @@ func (m *Meter) CreditTopUp(ctx context.Context, topup domain.TopUp) (int64, boo
 	lock := m.accountLock(topup.KeyHash)
 	lock.Lock()
 	defer lock.Unlock()
-	balance, inserted, err := m.Store.CreditTopUp(ctx, topup)
+	balance, inserted, err := m.store.CreditTopUp(ctx, topup)
 	if err == nil {
-		m.Cache.Set(topup.KeyHash, balance)
+		m.cache.Set(topup.KeyHash, balance)
 	}
 	return balance, inserted, err
 }
 
-func (m *Meter) PreflightUser(keyHash string, u domain.User) (int64, error) {
-	balance := m.Cache.Get(keyHash, u.BalanceMicroUSDC)
-	if balance <= 0 {
-		return 0, ledger.ErrInsufficientFunds
+func (m *Meter) PreflightUser(keyHash string, u domain.User) error {
+	if m.cache.Get(keyHash, u.BalanceMicroUSDC) <= 0 {
+		return ledger.ErrInsufficientFunds
 	}
-	return balance, nil
+	return nil
 }
 
 type Tracker struct {
@@ -127,8 +129,8 @@ type Tracker struct {
 }
 
 func (m *Meter) Tracker(keyHash string, initialBalance int64, started time.Time, maxTokens int) (*Tracker, error) {
-	reservation, err := money.MultiplyTokens(maxTokens, m.Config.PricePerTokenMicro)
-	if err != nil || !m.Cache.Reserve(keyHash, initialBalance, reservation) {
+	reservation, err := money.MultiplyTokens(maxTokens, m.price)
+	if err != nil || !m.cache.Reserve(keyHash, initialBalance, reservation) {
 		return nil, ledger.ErrInsufficientFunds
 	}
 	return &Tracker{meter: m, keyHash: keyHash, started: started, reserved: reservation}, nil
@@ -144,19 +146,11 @@ func (t *Tracker) Observe(event ollama.Event) {
 func (t *Tracker) Cancel() {
 	if !t.finished {
 		t.finished = true
-		t.meter.Cache.Release(t.keyHash, t.reserved)
+		t.meter.cache.Release(t.keyHash, t.reserved)
 	}
 }
 
-func (t *Tracker) Finalize(ctx context.Context, usage ollama.Event, partial bool) (int64, int64, error) {
-	return t.finalize(ctx, usage, partial, false)
-}
-
-func (t *Tracker) FinalizeInput(ctx context.Context, usage ollama.Event, partial bool) (int64, int64, error) {
-	return t.finalize(ctx, usage, partial, true)
-}
-
-func (t *Tracker) finalize(ctx context.Context, usage ollama.Event, partial, billInput bool) (int64, int64, error) {
+func (t *Tracker) Finalize(ctx context.Context, usage ollama.Event, partial, billInput bool) (int64, int64, error) {
 	if t.finished {
 		return 0, 0, nil
 	}
@@ -175,33 +169,25 @@ func (t *Tracker) finalize(ctx context.Context, usage ollama.Event, partial, bil
 	}
 	// Generation is priced by output. Embedding requests opt into input pricing
 	// because they produce vectors rather than generated text.
-	cost, err := money.MultiplyTokens(billedTokens, t.meter.Config.PricePerTokenMicro)
+	cost, err := money.MultiplyTokens(billedTokens, t.meter.price)
 	if err != nil {
-		t.meter.Cache.Release(t.keyHash, t.reserved)
+		t.meter.cache.Release(t.keyHash, t.reserved)
 		return 0, 0, err
 	}
 	lock := t.meter.accountLock(t.keyHash)
 	lock.Lock()
-	balance, err := t.meter.Store.Debit(ctx, domain.Debit{KeyHash: t.keyHash, PromptTokens: prompt, CompletionTokens: completion, CostMicroUSDC: cost, Latency: time.Since(t.started), Partial: partial})
+	balance, err := t.meter.store.Debit(ctx, domain.Debit{KeyHash: t.keyHash, PromptTokens: prompt, CompletionTokens: completion, CostMicroUSDC: cost, Latency: time.Since(t.started), Partial: partial})
 	if err != nil {
 		lock.Unlock()
-		t.meter.Cache.Release(t.keyHash, t.reserved)
+		t.meter.cache.Release(t.keyHash, t.reserved)
 		return 0, cost, err
 	}
-	t.meter.Cache.AfterDebit(t.keyHash, balance, t.reserved)
+	t.meter.cache.AfterDebit(t.keyHash, balance, t.reserved)
 	lock.Unlock()
 	return balance, cost, nil
 }
 
 func estimateTokens(text string) int {
-	// This is only a fallback for streams that end without Ollama's final usage.
-	runes := len([]rune(text))
-	if runes < 1 {
-		return 0
-	}
-	n := (runes + 3) / 4
-	if n < 1 {
-		return 1
-	}
-	return n
+	// Fallback for streams that end without Ollama's final usage: ~4 chars/token.
+	return (len([]rune(text)) + 3) / 4
 }

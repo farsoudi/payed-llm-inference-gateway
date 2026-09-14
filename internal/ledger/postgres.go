@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/farsoudi/payed-llm-inference/internal/domain"
 	"github.com/jackc/pgx/v5"
@@ -188,7 +187,3 @@ func (p *Postgres) Debit(ctx context.Context, debit domain.Debit) (balance int64
 
 // Compile time enforcement that Postgres implements Store interface
 var _ Store = (*Postgres)(nil)
-
-func RequestContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(parent, timeout)
-}

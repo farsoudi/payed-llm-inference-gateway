@@ -2,8 +2,6 @@ package domain
 
 import "time"
 
-const MicroUSDCPerUSDC int64 = 1_000_000
-
 type User struct {
 	ID               int64     `json:"id"`
 	Label            string    `json:"label"`

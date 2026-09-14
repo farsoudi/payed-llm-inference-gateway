@@ -104,7 +104,7 @@ func TestStreamNDJSONPreservesFramingAndUsage(t *testing.T) {
 	input := "{\"response\":\"hi\",\"done\":false}\r\n{\"done\":true,\"prompt_eval_count\":3,\"eval_count\":4}\r\n"
 	c := Client{}
 	var output strings.Builder
-	result, err := c.StreamNDJSON(strings.NewReader(input), func(raw []byte, _ Event) error {
+	usage, err := c.StreamNDJSON(strings.NewReader(input), func(raw []byte, _ Event) error {
 		output.Write(raw)
 		return nil
 	})
@@ -114,8 +114,8 @@ func TestStreamNDJSONPreservesFramingAndUsage(t *testing.T) {
 	if output.String() != input {
 		t.Fatalf("framing changed: %q", output.String())
 	}
-	if result.Usage.PromptEvalCount != 3 || result.Usage.EvalCount != 4 {
-		t.Fatalf("usage: %+v", result.Usage)
+	if usage.PromptEvalCount != 3 || usage.EvalCount != 4 {
+		t.Fatalf("usage: %+v", usage)
 	}
 }
 
@@ -127,7 +127,7 @@ func TestStreamSSEPreservesFramesAndMergesUsage(t *testing.T) {
 	c := Client{}
 	var output strings.Builder
 	var text string
-	result, err := c.StreamSSE(strings.NewReader(input), func(raw []byte, event Event) error {
+	usage, err := c.StreamSSE(strings.NewReader(input), func(raw []byte, event Event) error {
 		output.Write(raw)
 		text += event.Text
 		return nil
@@ -138,22 +138,22 @@ func TestStreamSSEPreservesFramesAndMergesUsage(t *testing.T) {
 	if output.String() != input {
 		t.Fatalf("framing changed: %q", output.String())
 	}
-	if text != "hi" || result.Usage.PromptEvalCount != 3 || result.Usage.EvalCount != 4 {
-		t.Fatalf("text %q, result: %+v", text, result)
+	if text != "hi" || usage.PromptEvalCount != 3 || usage.EvalCount != 4 {
+		t.Fatalf("text %q, usage: %+v", text, usage)
 	}
 }
 
 func TestStreamKeepsTerminalUsageWhenCallbackFails(t *testing.T) {
 	c := Client{}
 	wantErr := io.ErrClosedPipe
-	result, err := c.StreamNDJSON(strings.NewReader("{\"done\":true,\"eval_count\":9}\n"), func([]byte, Event) error {
+	usage, err := c.StreamNDJSON(strings.NewReader("{\"done\":true,\"eval_count\":9}\n"), func([]byte, Event) error {
 		return wantErr
 	})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("stream error = %v, want %v", err, wantErr)
 	}
-	if result.Usage.EvalCount != 9 {
-		t.Fatalf("terminal usage lost after callback failure: %+v", result.Usage)
+	if usage.EvalCount != 9 {
+		t.Fatalf("terminal usage lost after callback failure: %+v", usage)
 	}
 }
 
