@@ -1,0 +1,22 @@
+[Unit]
+Description=Paid LLM inference gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gateway
+Group=gateway
+WorkingDirectory=/opt/payed-llm-inference
+ExecStart=/opt/payed-llm-inference/gateway serve --config=/etc/payed-llm-inference/gateway.env
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/etc/payed-llm-inference/gateway.env
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/payed-llm-inference
+
+[Install]
+WantedBy=multi-user.target
