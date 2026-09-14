@@ -1,0 +1,44 @@
+# Go build artifacts and binaries
+/gateway
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage, profiling, tracing, and test output
+coverage.out
+coverage.html
+*.coverprofile
+*.prof
+*.pprof
+*.trace
+/test-results/
+
+# Logs and local runtime data
+*.log
+/data/
+/tmp/
+
+# Local environment and secrets
+*.env
+!.env.example
+!config.example.env
+
+# IDE and editor files
+.idea/
+.vscode/
+.fleet/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
