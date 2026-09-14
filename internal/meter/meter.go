@@ -14,8 +14,8 @@ import (
 
 type balanceValue struct{ actual, reserved int64 }
 
-// BalanceCache tracks the durable balance and local estimated spend reserved
-// by active streams. This prevents concurrent streams from all spending the
+// BalanceCache tracks the durable balance and maximum spend reserved locally
+// by active requests. This prevents concurrent requests from all spending the
 // same visible balance while keeping Postgres authoritative for final billing.
 type BalanceCache struct {
 	mu     sync.Mutex
@@ -35,10 +35,10 @@ func (c *BalanceCache) Get(key string, fallback int64) int64 {
 	return entry.actual - entry.reserved
 }
 
-func (c *BalanceCache) Set(key string, value int64) {
+func (c *BalanceCache) Set(key string, balance int64) {
 	c.mu.Lock()
 	entry := c.values[key]
-	entry.actual = value
+	entry.actual = balance
 	c.values[key] = entry
 	c.mu.Unlock()
 }
@@ -65,6 +65,7 @@ func (c *BalanceCache) Reserve(key string, fallback, amount int64) bool {
 func (c *BalanceCache) AfterDebit(key string, balance, reservation int64) {
 	c.mu.Lock()
 	entry := c.values[key]
+	// The durable result is authoritative; callers serialize it per account.
 	entry.actual = balance
 	entry.reserved -= reservation
 	if entry.reserved < 0 {
@@ -89,69 +90,77 @@ type Meter struct {
 	Store  ledger.Store
 	Cache  *BalanceCache
 	Config config.Config
+	locks  sync.Map
 }
 
-func (m *Meter) Preflight(ctx context.Context, keyHash string) (domain.User, int64, error) {
-	u, err := m.Store.GetUser(ctx, keyHash)
-	if err != nil {
-		return domain.User{}, 0, err
+func (m *Meter) accountLock(keyHash string) *sync.Mutex {
+	lock, _ := m.locks.LoadOrStore(keyHash, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func (m *Meter) CreditTopUp(ctx context.Context, topup domain.TopUp) (int64, bool, error) {
+	lock := m.accountLock(topup.KeyHash)
+	lock.Lock()
+	defer lock.Unlock()
+	balance, inserted, err := m.Store.CreditTopUp(ctx, topup)
+	if err == nil {
+		m.Cache.Set(topup.KeyHash, balance)
 	}
+	return balance, inserted, err
+}
+
+func (m *Meter) PreflightUser(keyHash string, u domain.User) (int64, error) {
 	balance := m.Cache.Get(keyHash, u.BalanceMicroUSDC)
 	if balance <= 0 {
-		return domain.User{}, 0, ledger.ErrInsufficientFunds
+		return 0, ledger.ErrInsufficientFunds
 	}
-	return u, balance, nil
+	return balance, nil
 }
 
 type Tracker struct {
 	meter     *Meter
 	keyHash   string
-	balance   int64
 	started   time.Time
-	lastCheck int
 	estimated int
 	reserved  int64
-	stopped   bool
+	finished  bool
 }
 
-func (m *Meter) Tracker(keyHash string, initialBalance int64, started time.Time) *Tracker {
-	return &Tracker{meter: m, keyHash: keyHash, balance: initialBalance, started: started}
+func (m *Meter) Tracker(keyHash string, initialBalance int64, started time.Time, maxTokens int) (*Tracker, error) {
+	reservation, err := money.MultiplyTokens(maxTokens, m.Config.PricePerTokenMicro)
+	if err != nil || !m.Cache.Reserve(keyHash, initialBalance, reservation) {
+		return nil, ledger.ErrInsufficientFunds
+	}
+	return &Tracker{meter: m, keyHash: keyHash, started: started, reserved: reservation}, nil
 }
 
-func (t *Tracker) Observe(event ollama.Event) error {
-	text := event.Response + event.Message.Content
+func (t *Tracker) Observe(event ollama.Event) {
+	text := event.Text
 	if text != "" {
 		t.estimated += estimateTokens(text)
 	}
-	if !event.Done && t.estimated-t.lastCheck >= t.meter.Config.CheckpointTokens {
-		t.lastCheck = t.estimated
-		balance := t.meter.Cache.Get(t.keyHash, t.balance)
-		cost, _ := money.MultiplyTokens(t.estimated, t.meter.Config.PricePerTokenMicro)
-		delta := cost - t.reserved
-		if delta > 0 && !t.meter.Cache.Reserve(t.keyHash, balance, delta) {
-			t.stopped = true
-			return ollama.ErrStopped
-		}
-		if delta > 0 {
-			t.reserved = cost
-		}
-		remaining := t.meter.Cache.Get(t.keyHash, balance)
-		rate := float64(t.estimated) / time.Since(t.started).Seconds()
-		if rate <= 0 {
-			rate = 1
-		}
-		leadCost, _ := money.MultiplyTokens(int(rate*t.meter.Config.ReloadLead.Seconds()), t.meter.Config.PricePerTokenMicro)
-		if remaining <= leadCost {
-			t.stopped = true
-			return ollama.ErrStopped
-		}
-	}
-	return nil
 }
 
-func (t *Tracker) Partial() bool { return t.stopped }
+func (t *Tracker) Cancel() {
+	if !t.finished {
+		t.finished = true
+		t.meter.Cache.Release(t.keyHash, t.reserved)
+	}
+}
 
 func (t *Tracker) Finalize(ctx context.Context, usage ollama.Event, partial bool) (int64, int64, error) {
+	return t.finalize(ctx, usage, partial, false)
+}
+
+func (t *Tracker) FinalizeInput(ctx context.Context, usage ollama.Event, partial bool) (int64, int64, error) {
+	return t.finalize(ctx, usage, partial, true)
+}
+
+func (t *Tracker) finalize(ctx context.Context, usage ollama.Event, partial, billInput bool) (int64, int64, error) {
+	if t.finished {
+		return 0, 0, nil
+	}
+	t.finished = true
 	completion := usage.EvalCount
 	prompt := usage.PromptEvalCount
 	if completion <= 0 {
@@ -160,26 +169,32 @@ func (t *Tracker) Finalize(ctx context.Context, usage ollama.Event, partial bool
 	if prompt < 0 {
 		prompt = 0
 	}
-	// The configured price is for generated output. Prompt tokens remain in the
-	// ledger for auditability but do not consume the prepaid balance.
-	cost, err := money.MultiplyTokens(completion, t.meter.Config.PricePerTokenMicro)
+	billedTokens := completion
+	if billInput {
+		billedTokens = prompt
+	}
+	// Generation is priced by output. Embedding requests opt into input pricing
+	// because they produce vectors rather than generated text.
+	cost, err := money.MultiplyTokens(billedTokens, t.meter.Config.PricePerTokenMicro)
 	if err != nil {
 		t.meter.Cache.Release(t.keyHash, t.reserved)
 		return 0, 0, err
 	}
+	lock := t.meter.accountLock(t.keyHash)
+	lock.Lock()
 	balance, err := t.meter.Store.Debit(ctx, domain.Debit{KeyHash: t.keyHash, PromptTokens: prompt, CompletionTokens: completion, CostMicroUSDC: cost, Latency: time.Since(t.started), Partial: partial})
 	if err != nil {
+		lock.Unlock()
 		t.meter.Cache.Release(t.keyHash, t.reserved)
 		return 0, cost, err
 	}
 	t.meter.Cache.AfterDebit(t.keyHash, balance, t.reserved)
+	lock.Unlock()
 	return balance, cost, nil
 }
 
-func (m *Meter) Credit(keyHash string, balance int64) { m.Cache.Set(keyHash, balance) }
-
 func estimateTokens(text string) int {
-	// This is only a checkpoint estimate. Ollama's final eval_count is used for billing.
+	// This is only a fallback for streams that end without Ollama's final usage.
 	runes := len([]rune(text))
 	if runes < 1 {
 		return 0

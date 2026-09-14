@@ -34,6 +34,7 @@ The API key is required for all authenticated gateway routes:
 - `POST /v1/topups`
 - `POST /v1/generate`
 - `POST /v1/chat/completions`
+- Every other Ollama `/api/*` and `/v1/*` route
 
 `GET /healthz` is the only unauthenticated route.
 
@@ -262,8 +263,8 @@ without the API key cannot select an account to credit.
 
 ## 9. Making Inference Requests
 
-Once the account has a positive balance, the client continues to use the same
-API key.
+Once the account has enough balance to reserve the request's capped output, the
+client continues to use the same API key.
 
 ```sh
 curl -N "$PAYED_GATEWAY_URL/v1/chat/completions" \
@@ -279,11 +280,29 @@ curl -N "$PAYED_GATEWAY_URL/v1/chat/completions" \
 
 The gateway authenticates the key, checks its balance and limits, calls the
 configured Ollama model, streams the response, and debits generated output
-usage.
+usage. The native route keeps Ollama's NDJSON format:
 
-The current routes return Ollama-style JSON/NDJSON. They are not currently a
-complete OpenAI-compatible API surface. See `code-architecture.md` and
-`todo.md` for the planned OpenCode compatibility work.
+```sh
+curl -N "$PAYED_GATEWAY_URL/api/generate" \
+  -H "Authorization: Bearer $PAYED_GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain x402 briefly","stream":true}'
+```
+
+The OpenAI-compatible route keeps SSE instead:
+
+```sh
+curl -N "$PAYED_GATEWAY_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $PAYED_GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"ignored-by-gateway","messages":[{"role":"user","content":"Explain x402 briefly"}],"stream":true}'
+```
+
+Native `/api/*` requests retain Ollama JSON/NDJSON. OpenAI-compatible `/v1/*`
+requests retain Ollama's OpenAI JSON/SSE surface, including tool-call fields.
+Unmetered routes are transparently proxied. Metered routes are
+protocol-compatible: the gateway pins policy fields, observes documented
+usage fields, and reserves the capped request cost before calling Ollama.
 
 ## 10. Remote OpenCode Authentication
 
@@ -311,10 +330,9 @@ This should cause the client provider to send:
 Authorization: Bearer <PAYED_GATEWAY_API_KEY>
 ```
 
-That header is accepted by the gateway. However, the current gateway response
-format is Ollama NDJSON rather than OpenAI SSE/JSON. Authentication being
-compatible does not make the complete OpenCode integration compatible. The
-OpenCode-specific protocol work is tracked in `todo.md`.
+That header is accepted by the gateway, and the `/v1` request/response protocol
+is forwarded as OpenAI-compatible JSON/SSE. The gateway still pins the model and
+caps output tokens according to its configuration.
 
 OpenCode also cannot automatically perform the gateway's x402 top-up merely
 because an API key is configured. The account must be funded separately by an
@@ -330,9 +348,8 @@ The gateway should remain a transport, accounting, and policy boundary. It
 should not execute tools or MCP operations and should not receive the client's
 private wallet key.
 
-The current gateway forwards unknown JSON fields to Ollama, but reliable
-OpenCode tool-call support still depends on protocol compatibility work. In a
-complete client loop:
+The wildcard proxy forwards unknown JSON fields and tool definitions to Ollama
+without executing them. In a complete client loop:
 
 ```text
 OpenCode sends tool request
@@ -381,7 +398,7 @@ single-process request still has to reach its normal completion or error path.
 - Put a wallet private key in the gateway configuration.
 - Use a real Base wallet while testing Base Sepolia.
 - Assume an x402 payment alone identifies the gateway account.
-- Assume the gateway will automatically fund a depleted account.
+- Assume the gateway will automatically fund an account with insufficient balance.
 
 The gateway logs request metadata such as method, path, status, and duration.
 It does not intentionally log the raw API key, prompt, completion, tool
@@ -425,10 +442,10 @@ outbound connectivity. Do not repeatedly submit real payments while debugging.
 
 ### OpenCode Auth Works But Requests Fail
 
-This usually means the Bearer header is correct but the response protocol is
-not. The current gateway returns Ollama-style NDJSON while OpenCode's
-OpenAI-compatible provider expects OpenAI JSON/SSE. Authentication and protocol
-compatibility are separate concerns.
+This usually means the Bearer header is correct but the selected model/provider
+configuration is not. The gateway preserves native Ollama JSON/NDJSON under
+`/api/*` and OpenAI-compatible JSON/SSE under `/v1/*`; authentication and
+provider configuration remain separate concerns.
 
 ## 15. Client Checklist
 
@@ -441,15 +458,17 @@ Before using a client from another machine:
 - `GET /v1/users/me` returns 200.
 - Account has a balance from a completed x402 top-up.
 - Client sends `Authorization: Bearer <key>` or `X-API-Key`.
-- Client understands the gateway's current Ollama-style response format.
-- Client handles `partial: true` and `top_up_required: true` on depletion.
+- Client uses native Ollama JSON/NDJSON or OpenAI-compatible JSON/SSE according
+  to the selected route.
+- Client handles HTTP 402 when its balance cannot cover the requested output
+  limit.
 - Client does not expect the gateway to execute tools.
 - Client does not send a wallet private key to the gateway.
 
 ## 16. Files To Read Next
 
 - `README.md`: setup and command examples.
-- `model.md`: intended payment and depletion behavior.
+- `model.md`: intended payment, reservation, and settlement behavior.
 - `code-architecture.md`: source-level module and workflow explanation.
 - `engineering-choices.md`: deliberate implementation choices and limitations.
 - `internal/auth/auth.go`: exact header extraction and hashing behavior.

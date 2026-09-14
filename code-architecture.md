@@ -70,8 +70,8 @@ implementation packages directly.
 | `ledger` | `internal/ledger/store.go` | Storage interface and storage errors |
 | `ledger` | `internal/ledger/postgres.go` | Postgres pool and accounting transactions |
 | `payment` | `internal/payment/payment.go` | x402 requirement, verification, settlement, and response headers |
-| `ollama` | `internal/ollama/client.go` | Ollama HTTP adapter and NDJSON stream reader |
-| `meter` | `internal/meter/meter.go` | Balance cache, reservations, checkpoints, and final debit |
+| `ollama` | `internal/ollama/client.go` | Complete reverse proxy, request preparation, and native/SSE stream readers |
+| `meter` | `internal/meter/meter.go` | Balance cache, upfront reservations, usage observation, and final debit |
 | `guardrails` | `internal/guardrails/guardrails.go` | Per-key rate and concurrency limiting |
 | `guardrails` | `internal/guardrails/failures.go` | Process-local repeated-failure monitoring |
 | `httpapi` | `internal/httpapi/server.go` | Routes, authentication, orchestration, response handling |
@@ -160,11 +160,10 @@ implementation.
 - Facilitator: Coinbase CDP's x402 endpoint.
 - Price: `5` micro-USDC per generated token.
 - Minimum top-up: `500000` micro-USDC, or `$0.50`.
-- Checkpoint size: `25` estimated output tokens.
-- Reload lead: `8s`.
 - Safety ceiling: `16384` generated tokens.
 - Request timeout: `10m`.
-- Request body limit: `1 MiB`.
+- Gateway-owned and metered JSON request body limit: `1 MiB`. Transparent
+  Ollama routes preserve arbitrary request bodies, including blob uploads.
 - New-user rate limit: `60` requests per minute.
 - New-user concurrency limit: `1` request.
 
@@ -175,8 +174,7 @@ The server validates:
 - `POSTGRES_URL` is present.
 - `PAY_TO` is a non-zero 20-byte hexadecimal EVM address.
 - Ollama URL and model are present.
-- Price, minimum top-up, safety ceiling, checkpoint size, timeouts, and limits
-  are positive.
+- Price, minimum top-up, safety ceiling, timeouts, and limits are positive.
 - Network is either `base-sepolia` or `base`.
 - Facilitator URL is HTTP or HTTPS.
 - Mainnet facilitator URLs use HTTPS.
@@ -436,17 +434,20 @@ together while the lower-level packages remain independently understandable.
 
 ### Routes
 
-`Server.Handler()` registers method-specific standard-library routes:
+`Server.Handler()` registers the gateway-owned routes and one wildcard fallback:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/healthz` | Unauthenticated health response |
 | `GET` | `/v1/users/me` | Authenticated account and balance lookup |
 | `POST` | `/v1/topups` | Dynamic x402-funded balance top-up |
-| `POST` | `/v1/generate` | Authenticated Ollama generation proxy |
-| `POST` | `/v1/chat/completions` | Authenticated Ollama chat proxy |
+| `ANY` | `/api/*` and `/v1/*` | Authenticated Ollama API proxy; known compute paths add metering |
+| `ANY` | `/` | Authenticated Ollama root/status proxy |
 
-The route uses Go's `http.ServeMux`; no third-party router is needed.
+The route uses Go's `http.ServeMux`; no third-party router is needed. The
+wildcard handler does not enumerate Ollama routes, so newly added Ollama APIs
+are available without gateway code changes. `/v1/users/me` and `/v1/topups`
+remain gateway-owned and take precedence over the wildcard.
 
 ### Request Logging Wrapper
 
@@ -561,12 +562,28 @@ is the recovery mechanism for an ambiguous database failure.
 
 ## 14. Ollama Adapter
 
-`internal/ollama/client.go` is the only package that knows the Ollama HTTP API.
-The rest of the gateway deals in generic request bytes and `ollama.Event` data.
+`internal/ollama/client.go` is the only package that knows the Ollama HTTP
+transport and stream framing. The rest of the gateway deals in generic request
+bytes and the small `ollama.Event` usage view.
+
+### Complete Proxy
+
+`Client.Proxy()` builds a standard-library `httputil.ReverseProxy` against the
+configured Ollama origin. It preserves the incoming method, path, query string,
+body, ordinary headers, response status, response headers, and streaming bytes.
+It removes the gateway's API-key/payment headers before forwarding and uses a
+negative flush interval so streaming responses are delivered as soon as the
+upstream writes them.
+
+This is deliberately a transparent proxy instead of an implementation of every
+Ollama route. Any Ollama `/api/*` or `/v1/*` endpoint, including model
+management, status, blobs, OpenAI compatibility, and future routes, reaches the
+same upstream path. The HTTP layer only classifies known compute paths when it
+needs to add balance admission and billing.
 
 ### Request Preparation
 
-`Client.Prepare()`:
+`Client.PrepareNative()`:
 
 1. Decodes the body as a JSON object.
 2. Pins `model` to the configured model, ignoring a client-selected model.
@@ -579,26 +596,37 @@ The rest of the gateway deals in generic request bytes and `ollama.Event` data.
 This protects the host from an arbitrary model request and from an unbounded
 generation request.
 
+`Client.PrepareModel()` pins model-only requests such as embeddings without
+adding generation limits. `Client.PrepareCompatible()` preserves the
+OpenAI/Anthropic-compatible body, pins `model`, and caps an existing or
+endpoint-appropriate `max_*_tokens` field without removing other fields.
+
 ### HTTP Request
 
-`Client.Stream()` creates a POST request to:
+`Client.Do()` preserves the incoming end-to-end headers, replaces the prepared
+JSON body and destination, disables redirects, and returns the upstream response
+without imposing a schema. Native streaming bodies are then read from:
 
 ```text
 OLLAMA_URL + "/api/generate"
-```
-
-or:
-
-```text
 OLLAMA_URL + "/api/chat"
 ```
 
-It applies the request context, sends JSON, rejects upstream HTTP errors, and
-reads the response using a buffered scanner with a 2 MiB maximum line size.
+The OpenAI-compatible paths use `Client.StreamSSE()` instead:
+
+```text
+OLLAMA_URL + "/v1/chat/completions"
+OLLAMA_URL + "/v1/completions"
+OLLAMA_URL + "/v1/responses"
+OLLAMA_URL + "/v1/messages"
+```
+
+Both readers enforce a 2 MiB maximum native line/SSE-frame size. Upstream HTTP
+errors and redirects are forwarded before stream parsing.
 
 ### NDJSON Events
 
-Each line is:
+Each native line is:
 
 1. Copied as raw bytes.
 2. Decoded into `ollama.Event`.
@@ -608,50 +636,60 @@ The event captures both generation-shaped `response` text and chat-shaped
 `message.content`, plus completion metadata:
 
 - `done`.
-- `done_reason`.
 - `prompt_eval_count`.
 - `eval_count`.
-- `total_duration`.
 
 The final event is required for a normal completion. EOF without a final `done`
 event becomes an error.
 
-If the callback returns `ollama.ErrStopped`, the client closes its read path and
-returns a stopped result rather than treating the expected depletion as an
-upstream failure.
+### SSE Events
+
+`StreamSSE()` reads complete Server-Sent Events frames, joins their `data:`
+lines for observation, and forwards the original frame byte-for-byte. It recognizes
+OpenAI's `data: [DONE]` terminal frame and the `response.completed` and
+`message_stop` terminal event types. `EventFromJSON()` extracts only common text
+and usage fields (`prompt_tokens`/`input_tokens`, `completion_tokens`/
+`output_tokens`) with shallow protocol structs and merges usage split across
+events. It does not recursively guess fields or translate tool calls, images,
+structured output, reasoning, or other payload fields.
 
 ## 15. Inference Request Workflow
 
-Both `/v1/generate` and `/v1/chat/completions` call the same `inference()`
-function with a different Ollama endpoint.
+All known billable native, OpenAI-compatible, and Anthropic-compatible compute
+paths call the same `inference()` function with a protocol-specific
+`inferenceSpec`. Unclassified Ollama paths go directly through the transparent
+proxy.
 
 ### Before Calling Ollama
 
 The handler:
 
 1. Authenticates the key.
-2. Calls `Meter.Preflight()`.
+2. Checks the locally available balance.
 3. Rejects a non-positive available balance with HTTP 402.
 4. Loads user-specific rate and concurrency limits.
 5. Acquires a guardrail slot.
 6. Reads the request body with the configured maximum size.
-7. Parses the optional boolean `stream` field; streaming defaults to true.
-8. Calls `Ollama.Prepare()`.
+7. Parses the optional boolean `stream` field; native streaming defaults to true
+   and OpenAI-compatible streaming defaults to false.
+8. Calls the protocol-appropriate Ollama request preparer.
 9. Creates a request timeout context.
-10. Creates a meter tracker.
+10. Reserves the capped maximum request cost and creates a meter tracker. If the
+    reservation fails, it returns HTTP 402 before calling Ollama.
 
 Ollama is not contacted until authentication, balance, guardrail, body, and
 safety checks pass.
 
 ### Streaming Mode
 
-For streaming mode, the handler sets `Content-Type: application/x-ndjson`,
-then calls `Ollama.Stream()`.
+For native streaming mode, the handler preserves the upstream content type and
+calls `Ollama.StreamNDJSON()`. OpenAI-compatible and Anthropic-compatible
+streaming calls `Ollama.StreamSSE()`.
 
 For each event, the callback:
 
 1. Gives the event to `Tracker.Observe()`.
-2. Writes the original raw event plus a newline to the client.
+2. Writes the original raw native event or SSE frame to the client.
 3. Flushes the writer when `http.Flusher` is available.
 
 The HTTP status is intentionally not committed until the first output write.
@@ -659,12 +697,13 @@ This means an Ollama connection failure before any output can still become an
 HTTP 502 instead of an empty HTTP 200 response.
 
 If output has already been sent, a later failure cannot change the HTTP status.
-The handler appends a partial terminal event and bills the observed usage.
+The stream ends at that point and observed usage is finalized against the
+existing reservation.
 
 ### Non-Streaming Mode
 
-For non-streaming mode, the callback keeps only the last raw event. The handler
-waits for Ollama to finish, finalizes billing, and then writes the final event as
+For non-streaming mode, the handler reads the upstream JSON, observes usage,
+finalizes billing, and then writes the original JSON response as
 `application/json`.
 
 This mode can return a normal HTTP error if Ollama or final billing fails before
@@ -680,7 +719,7 @@ accounting.
 `BalanceCache` stores, per key:
 
 - `actual`: the latest durable balance known from Postgres.
-- `reserved`: estimated cost currently held by active streams.
+- `reserved`: maximum cost currently held by active requests.
 
 The available local balance is:
 
@@ -689,22 +728,20 @@ available = actual - reserved
 ```
 
 `Get()` lazily initializes a key from the Postgres value returned during
-preflight. `Credit()` updates the actual balance while preserving reservations
-belonging to active requests.
+preflight. `Set()` and `AfterDebit()` adopt the authoritative durable balance
+while preserving reservations belonging to active requests.
 
 `Reserve()` atomically increases the local reservation only when enough
-available balance remains. `AfterDebit()` replaces the actual value with the
-Postgres result and removes the stream's reservation. `Release()` removes a
-reservation when final accounting fails.
+available balance remains. `Release()` removes a reservation when a request
+never reaches final accounting.
 
-The cache is protected by a mutex, so two streams in the same process cannot
-both reserve the same local amount.
+`Meter` serializes each key's durable money operation and cache update under one
+per-key lock. A top-up and a debit for the same key cannot interleave their
+Postgres result and cache update, so the cache cannot be left above or below the
+durable balance. Different keys never block each other.
 
-### Preflight
-
-`Meter.Preflight()` reads the user from Postgres and asks the cache for available
-balance. It only requires some positive balance; it does not reserve the entire
-possible `max_tokens` amount.
+The cache itself is protected by a mutex, so two requests cannot both reserve
+the same local amount.
 
 ### Tracker
 
@@ -712,31 +749,21 @@ Each request gets a `Tracker` containing:
 
 - The meter.
 - Key hash.
-- Initial balance fallback.
 - Start time.
-- Last checkpoint token estimate.
 - Current generated-text estimate.
-- Current local cost reservation.
-- Partial/stopped state.
+- Maximum local cost reservation.
+- Finalized/canceled state.
 
-### Checkpoint Calculation
+### Reservation
 
-`Tracker.Observe()` combines `response` and `message.content`, then estimates
-tokens as approximately one token per four Unicode characters. This estimate is
-only for an early stop decision because Ollama normally reports exact counts at
-the final event.
+Creating a tracker reserves `max_tokens * PRICE_PER_TOKEN_MICRO` after gateway
+policy caps the request. For embeddings, the request byte length is a
+conservative input-token upper bound. Reservation failure returns HTTP 402
+before Ollama receives the request.
 
-At each configured checkpoint:
-
-1. Convert estimated output tokens to estimated micro-USDC cost.
-2. Reserve the difference from the prior reservation.
-3. Calculate available balance after reservations.
-4. Calculate estimated tokens per second from request age.
-5. Calculate the cost of the configured reload lead time.
-6. Stop when the available balance cannot cover that lead-time cost.
-
-The current event is still forwarded before the partial marker is written. This
-avoids silently discarding the output that triggered the checkpoint.
+`Tracker.Observe()` still estimates tokens from visible text, but only as a
+fallback when an interrupted stream never reports exact usage. It does not make
+admission or mid-stream stop decisions.
 
 ### Finalization
 
@@ -747,7 +774,7 @@ avoids silently discarding the output that triggered the checkpoint.
 3. Records `prompt_eval_count` for auditability.
 4. Bills generated output tokens only.
 5. Calls `Store.Debit()` with latency and partial state.
-6. Updates or releases the cache reservation based on the result.
+6. Updates the cache from the durable result and removes the full reservation.
 
 The final cost is:
 
@@ -758,30 +785,18 @@ completion_tokens * PRICE_PER_TOKEN_MICRO
 Prompt tokens are recorded but not charged because the project prices the
 expensive generated output rather than prompt ingestion.
 
-## 17. Balance Depletion Workflow
+`Tracker.FinalizeInput()` is used for embedding endpoints. Embeddings do not
+generate completion text, so their reported input tokens are charged at the
+same configured per-token rate while remaining recorded in `prompt_tokens`.
+This applies to `/api/embed` and `/v1/embeddings`. Legacy `/api/embeddings` is
+proxied without token billing because its response does not report usage.
 
-When a checkpoint stops a stream, `httpapi.inference()` emits a final NDJSON
-metadata event:
+## 17. Insufficient Balance Workflow
 
-```json
-{
-  "done": true,
-  "done_reason": "balance_depleted",
-  "partial": true,
-  "top_up_required": true
-}
-```
-
-The client must:
-
-1. Read the partial output.
-2. Top up through `/v1/topups` using an x402-aware wallet client.
-3. Retry inference with the relevant conversation history.
-
-The same HTTP stream cannot be turned into a new 402 exchange after its body has
-started. Ollama also does not expose a portable resumable-generation token. For
-these reasons the current implementation performs clean stop plus retry rather
-than pretending to resume the exact generation.
+If the available balance cannot cover the capped maximum cost, inference returns
+HTTP 402 before Ollama is contacted. The client can top up through `/v1/topups`
+and retry. No protocol-specific depletion frame is inserted into an active
+stream, so successful native and compatible streams retain Ollama's bytes.
 
 There is no automatic top-up in the gateway. Automatic funding would require
 client-side wallet authority and spending policy. An optional future MCP or
@@ -807,16 +822,19 @@ the user's private key.
 
 ### Balance And Guardrail Errors
 
-- No available balance: HTTP 402.
+- Balance cannot cover the capped request reservation: HTTP 402.
 - Canceled capacity wait: HTTP 429.
 - Storage insufficient-funds error: HTTP 402.
 
 ### Ollama Errors
 
-- Upstream HTTP error before output: HTTP 502.
+- Upstream HTTP errors preserve Ollama's status, headers, and body on both
+  metered and transparent routes.
 - Connection or decode error before output: HTTP 502.
-- Failure after streamed output: partial terminal event and final billing.
-- EOF without `done`: treated as an upstream stream failure.
+- Failure after streamed output: stream termination and final billing against
+  the existing reservation.
+- Native EOF without `done`, or SSE EOF without a terminal event: treated as an
+  upstream stream failure.
 
 ### x402 Errors
 
@@ -951,8 +969,12 @@ Current unit tests cover:
 
 - API-key generation and request extraction in `internal/auth/auth_test.go`.
 - Decimal money parsing and formatting in `internal/money/money_test.go`.
-- Ollama request normalization and final usage parsing in
-  `internal/ollama/client_test.go`.
+- Ollama request normalization, native usage, SSE framing, and final usage
+  parsing in `internal/ollama/client_test.go`.
+- Complete proxy forwarding, credential stripping, OpenAI SSE preservation, and
+  management-stream passthrough in `internal/httpapi/server_test.go`.
+- Per-key serialized balance-cache updates that preserve reservations in
+  `internal/meter/meter_test.go`.
 
 The latest local verification commands are:
 
@@ -973,7 +995,7 @@ The highest-value future integration tests are:
 - x402 402/verify/settle/credit sequencing with a mock facilitator.
 - Duplicate and conflicting transaction hashes.
 - Concurrent top-ups and debits.
-- Stream flushing, truncation, disconnect, and depletion behavior.
+- Stream flushing, truncation, disconnect, and reservation cleanup behavior.
 - Final billing when Ollama sends or omits its final usage event.
 - Revocation during an in-flight request.
 - CLI secret input and configured defaults.
@@ -981,26 +1003,17 @@ The highest-value future integration tests are:
 
 ## 24. Known Limitations
 
-### No True Mid-Stream Resume
-
-The planning documents describe pausing for a top-up and resuming. The current
-HTTP/Ollama implementation instead terminates cleanly and asks the client to
-retry. This is documented in `engineering-choices.md` because Ollama does not
-provide a portable resumable-generation API and a new x402 exchange cannot be
-inserted after a response has committed.
-
-### Estimated Checkpoints
+### Interrupted Usage Estimates
 
 Ollama final usage counts are authoritative when present. Before the final event,
-the gateway estimates tokens from streamed text. This estimate controls the
-early stop only; it is not a replacement tokenizer.
+the gateway estimates tokens from streamed text. This estimate is used only to
+account for an interrupted stream; it is not a replacement tokenizer.
 
 ### Final Debit Durability
 
-Only the final request debit is durable. Local checkpoint reservations are
+Only the final request debit is durable. The full local request reservation is
 released at completion. A process crash may lose usage that had been generated
-but not finalized; it will not create a false durable charge for unfinished
-output.
+but not finalized; it will not create a false durable charge for unfinished output.
 
 ### Single-Process State
 
@@ -1025,8 +1038,8 @@ If reading the implementation in order, use this sequence:
 4. Read `internal/auth/auth.go` to understand identity lookup.
 5. Read `internal/guardrails/guardrails.go` to understand request admission.
 6. Read `internal/ollama/client.go` to understand upstream streaming.
-7. Read `internal/meter/meter.go` to understand checkpoint reservations and
-   final billing.
+7. Read `internal/meter/meter.go` to understand upfront reservations and final
+   billing.
 8. Read `internal/ledger/store.go` and `internal/ledger/postgres.go` to see
    durable accounting and SQL transaction boundaries.
 9. Read `internal/payment/payment.go` to understand the x402 top-up handshake.

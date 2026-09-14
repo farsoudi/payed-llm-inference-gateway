@@ -24,8 +24,6 @@ type Config struct {
 	PricePerTokenMicro       int64
 	MinTopupMicro            int64
 	SafetyMaxTokens          int
-	CheckpointTokens         int
-	ReloadLead               time.Duration
 	RequestTimeout           time.Duration
 	MaxBodyBytes             int64
 	DefaultRatePerMin        int
@@ -42,8 +40,6 @@ func Defaults() Config {
 		PricePerTokenMicro: 5,
 		MinTopupMicro:      500_000,
 		SafetyMaxTokens:    16_384,
-		CheckpointTokens:   25,
-		ReloadLead:         8 * time.Second,
 		RequestTimeout:     10 * time.Minute,
 		MaxBodyBytes:       1 << 20,
 		DefaultRatePerMin:  60,
@@ -80,11 +76,11 @@ func (c Config) Validate() error {
 	if c.PricePerTokenMicro <= 0 || c.MinTopupMicro <= 0 {
 		return errors.New("price and minimum top-up must be positive")
 	}
-	if c.SafetyMaxTokens <= 0 || c.CheckpointTokens <= 0 {
-		return errors.New("safety and checkpoint token limits must be positive")
+	if c.SafetyMaxTokens <= 0 {
+		return errors.New("safety token limit must be positive")
 	}
-	if c.ReloadLead <= 0 || c.RequestTimeout <= 0 || c.MaxBodyBytes <= 0 {
-		return errors.New("reload lead, request timeout, and max body size must be positive")
+	if c.RequestTimeout <= 0 || c.MaxBodyBytes <= 0 {
+		return errors.New("request timeout and max body size must be positive")
 	}
 	if c.DefaultRatePerMin <= 0 || c.DefaultConcurrency <= 0 {
 		return errors.New("default limits must be positive")
@@ -158,8 +154,8 @@ func applyEnv(cfg *Config) error {
 var envKeys = map[string]struct{}{
 	"LISTEN_ADDR": {}, "OLLAMA_URL": {}, "OLLAMA_MODEL": {}, "POSTGRES_URL": {},
 	"NETWORK": {}, "PAY_TO": {}, "FACILITATOR_URL": {}, "FACILITATOR_AUTHORIZATION": {}, "PRICE_PER_TOKEN_MICRO": {},
-	"MIN_TOPUP_MICRO": {}, "SAFETY_MAX_TOKENS": {}, "CHECKPOINT_TOKENS": {},
-	"RELOAD_LEAD": {}, "REQUEST_TIMEOUT": {}, "MAX_BODY_BYTES": {},
+	"MIN_TOPUP_MICRO": {}, "SAFETY_MAX_TOKENS": {},
+	"REQUEST_TIMEOUT": {}, "MAX_BODY_BYTES": {},
 	"DEFAULT_RATE_PER_MIN": {}, "DEFAULT_CONCURRENCY": {},
 }
 
@@ -191,10 +187,6 @@ func set(c *Config, key, value string) error {
 		c.MinTopupMicro, err = int64Value()
 	case "SAFETY_MAX_TOKENS":
 		c.SafetyMaxTokens, err = intValue()
-	case "CHECKPOINT_TOKENS":
-		c.CheckpointTokens, err = intValue()
-	case "RELOAD_LEAD":
-		c.ReloadLead, err = durationValue()
 	case "REQUEST_TIMEOUT":
 		c.RequestTimeout, err = durationValue()
 	case "MAX_BODY_BYTES":

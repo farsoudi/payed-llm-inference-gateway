@@ -1,7 +1,7 @@
 # Paid LLM Inference Gateway
 
-This is a single Go binary that fronts an Ollama instance with invite-only API
-keys, prepaid USDC balances, usage metering, and per-key abuse controls.
+This is a single Go binary that fronts an entire Ollama HTTP API with invite-only
+API keys, prepaid USDC balances, usage metering, and per-key abuse controls.
 
 x402 is used only to fund a balance. Inference debits happen off-chain in
 Postgres using integer micro-USDC values.
@@ -50,7 +50,10 @@ testing the complete flow with test USDC.
 ## API
 
 All endpoints except `/healthz` use `Authorization: Bearer <api-key>`.
-`X-API-Key` is also accepted.
+`X-API-Key` is also accepted. The gateway reserves `/v1/users/me` and
+`/v1/topups`; every other Ollama `/api/*` and `/v1/*` route is authenticated and
+proxied without route enumeration. This includes model management, status,
+embeddings, OpenAI-compatible APIs, and new Ollama routes added later.
 
 Request a top-up. A first request returns an x402 `402 Payment Required`
 response containing the exact requested amount. An x402-aware client pays and
@@ -70,21 +73,60 @@ Inspect the current balance:
 curl http://localhost:8080/v1/users/me -H "Authorization: Bearer $API_KEY"
 ```
 
-Run generation through either endpoint:
+Run a native Ollama generation request:
+
+```sh
+curl -N http://localhost:8080/api/generate \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain x402 in one paragraph","stream":true}'
+```
+
+OpenAI-compatible clients such as OpenCode use Ollama's native compatibility
+surface, which preserves OpenAI JSON/SSE and tool-call semantics:
 
 ```sh
 curl -N http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Explain x402 in one paragraph"}],"stream":true}'
+  -d '{"model":"ignored-by-gateway","messages":[{"role":"user","content":"Explain x402 in one paragraph"}],"stream":true}'
 ```
 
-The gateway pins requests to the configured Ollama model and enforces the
-safety `num_predict` ceiling. Streaming responses retain Ollama's NDJSON
-format. If the predictive balance check reaches the reload threshold, the
-stream ends cleanly with a final event containing `partial: true` and
-`top_up_required: true`; the client can top up and retry with its conversation
-history.
+The gateway pins billable requests to the configured Ollama model and applies
+the configured generation safety ceiling (`num_predict` for native requests and
+the relevant `max_*_tokens` field for OpenAI-compatible requests). Native
+generation remains Ollama NDJSON. OpenAI-compatible generation remains SSE.
+Before calling Ollama, the gateway reserves enough local balance for the capped
+output limit. It bills exact reported usage at completion and releases the
+unused reservation. This keeps streams byte-compatible and prevents output from
+being delivered when the account cannot cover its requested maximum.
+
+### Complete Ollama Proxy
+
+The gateway uses a standard-library `httputil.ReverseProxy` for non-billable
+routes. It preserves the request method, path, query string, body, ordinary
+headers, response status, response headers, and streaming bytes. Gateway
+credentials and payment headers are removed before the request reaches Ollama.
+
+Known compute routes receive the same protocol-compatible upstream payloads and
+frames with an additional admission/metering layer:
+
+- Native generation: `/api/generate`, `/api/chat`, and the `/v1/generate`
+  compatibility alias.
+- Metered native embeddings: `/api/embed`.
+- OpenAI-compatible generation: `/v1/chat/completions`, `/v1/completions`,
+  `/v1/responses`, and `/v1/messages`.
+- OpenAI-compatible embeddings: `/v1/embeddings`.
+
+All other Ollama routes, including `/api/tags`, `/api/show`, `/api/ps`,
+`/api/version`, `/api/pull`, `/api/push`, `/api/create`, `/api/copy`,
+`/api/delete`, blob routes, `/v1/models`, and future routes are forwarded by the
+same wildcard proxy. They still require an API key and consume the key's
+rate/concurrency allowance. Model-management requests are not token-billed, so
+operators should issue keys and limits appropriate for the access they grant.
+The legacy `/api/embeddings` endpoint is also forwarded without token billing
+because its response does not report usage; use `/api/embed` or
+`/v1/embeddings` for metered embeddings.
 
 ## Admin commands
 
@@ -111,8 +153,8 @@ adjust paths and the service user, then enable it with `systemctl enable --now`.
 
 - `internal/payment`: x402 requirements, facilitator verification, and settlement
 - `internal/ledger`: Postgres balance and audit transactions
-- `internal/meter`: checkpoint estimates and final usage debit
-- `internal/ollama`: bounded request preparation and NDJSON streaming
+- `internal/meter`: request reservations and final usage debit
+- `internal/ollama`: request preparation, complete reverse proxying, and native/SSE stream observation
 - `internal/guardrails`: per-key rate and concurrency controls
 - `internal/httpapi`: HTTP contract and request orchestration
 - `cmd/gateway`: server and admin CLI entry point

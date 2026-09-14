@@ -30,13 +30,14 @@ type Server struct {
 	Limits   *guardrails.Controller
 	Failures *guardrails.FailureMonitor
 	Ollama   *ollama.Client
+	Proxy    http.Handler
 	Payments *payment.Service
 	Logger   *slog.Logger
 }
 
 func New(cfg config.Config, store ledger.Store) *Server {
 	cache := meter.NewBalanceCache()
-	return &Server{
+	s := &Server{
 		Config:   cfg,
 		Store:    store,
 		Meter:    &meter.Meter{Store: store, Cache: cache, Config: cfg},
@@ -46,6 +47,8 @@ func New(cfg config.Config, store ledger.Store) *Server {
 		Payments: payment.New(cfg),
 		Logger:   slog.Default(),
 	}
+	s.Proxy = s.Ollama.Proxy(s.proxyError)
+	return s
 }
 
 func (s *Server) Handler() http.Handler {
@@ -53,8 +56,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /v1/users/me", s.me)
 	mux.HandleFunc("POST /v1/topups", s.topup)
-	mux.HandleFunc("POST /v1/generate", s.generate)
-	mux.HandleFunc("POST /v1/chat/completions", s.chat)
+	mux.HandleFunc("/healthz", methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/v1/users/me", methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/v1/topups", methodNotAllowed(http.MethodPost))
+	mux.HandleFunc("/", s.proxy)
 	return requestLogging(mux, s.Logger)
 }
 
@@ -62,14 +67,16 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	_, hash, ok := s.user(w, r)
-	if !ok {
-		return
+func methodNotAllowed(allowed string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", allowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
-	u, err := s.Store.GetUser(r.Context(), hash)
-	if err != nil {
-		writeStoreError(w, err)
+}
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	u, _, ok := s.user(w, r)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, u)
@@ -96,12 +103,11 @@ func (s *Server) topup(w http.ResponseWriter, r *http.Request) {
 
 	protected := s.Payments.Protect(amount, "Fund inference gateway balance", func(settlement payment.Settlement) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			balance, inserted, err := s.Store.CreditTopUp(r.Context(), domain.TopUp{KeyHash: hash, Amount: amount, Transaction: settlement.Transaction, Payer: settlement.Payer, Network: settlement.Network})
+			balance, inserted, err := s.Meter.CreditTopUp(r.Context(), domain.TopUp{KeyHash: hash, Amount: amount, Transaction: settlement.Transaction, Payer: settlement.Payer, Network: settlement.Network})
 			if err != nil {
 				writeStoreError(w, err)
 				return
 			}
-			s.Meter.Credit(hash, balance)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"credited":     inserted,
 				"amount_usdc":  money.FormatUSDC(amount),
@@ -113,15 +119,53 @@ func (s *Server) topup(w http.ResponseWriter, r *http.Request) {
 	protected.ServeHTTP(w, r)
 }
 
-func (s *Server) generate(w http.ResponseWriter, r *http.Request) { s.inference(w, r, "/api/generate") }
-func (s *Server) chat(w http.ResponseWriter, r *http.Request)     { s.inference(w, r, "/api/chat") }
+type inferenceProtocol int
 
-func (s *Server) inference(w http.ResponseWriter, r *http.Request, endpoint string) {
-	_, hash, ok := s.user(w, r)
+const (
+	nativeNDJSON inferenceProtocol = iota
+	compatibleSSE
+	jsonResponse
+)
+
+type inferenceSpec struct {
+	endpoint      string
+	protocol      inferenceProtocol
+	defaultStream bool
+	billInput     bool
+}
+
+func classifyInference(method, path string) (inferenceSpec, bool) {
+	if method != http.MethodPost {
+		return inferenceSpec{}, false
+	}
+	switch path {
+	case "/api/generate", "/v1/generate":
+		return inferenceSpec{endpoint: "/api/generate", protocol: nativeNDJSON, defaultStream: true}, true
+	case "/api/chat":
+		return inferenceSpec{endpoint: "/api/chat", protocol: nativeNDJSON, defaultStream: true}, true
+	case "/api/embed":
+		return inferenceSpec{endpoint: path, protocol: jsonResponse, billInput: true}, true
+	case "/v1/chat/completions":
+		return inferenceSpec{endpoint: path, protocol: compatibleSSE}, true
+	case "/v1/completions":
+		return inferenceSpec{endpoint: path, protocol: compatibleSSE}, true
+	case "/v1/responses":
+		return inferenceSpec{endpoint: path, protocol: compatibleSSE}, true
+	case "/v1/messages":
+		return inferenceSpec{endpoint: path, protocol: compatibleSSE}, true
+	case "/v1/embeddings":
+		return inferenceSpec{endpoint: path, protocol: jsonResponse, billInput: true}, true
+	default:
+		return inferenceSpec{}, false
+	}
+}
+
+func (s *Server) inference(w http.ResponseWriter, r *http.Request, spec inferenceSpec) {
+	u, hash, ok := s.user(w, r)
 	if !ok {
 		return
 	}
-	u, _, err := s.Meter.Preflight(r.Context(), hash)
+	_, err := s.Meter.PreflightUser(hash, u)
 	if err != nil {
 		if errors.Is(err, ledger.ErrInsufficientFunds) {
 			writeError(w, http.StatusPaymentRequired, "top up your balance before requesting inference")
@@ -142,7 +186,7 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request, endpoint stri
 		s.noteFailure(r, "malformed_inference")
 		return
 	}
-	stream := true
+	stream := spec.defaultStream
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
 		s.noteFailure(r, "malformed_inference")
@@ -155,7 +199,14 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request, endpoint stri
 			return
 		}
 	}
-	prepared, err := s.Ollama.Prepare(body, stream, s.Config.SafetyMaxTokens)
+	var prepared []byte
+	if spec.protocol != nativeNDJSON && spec.protocol != jsonResponse {
+		prepared, err = s.Ollama.PrepareCompatible(body, spec.endpoint, s.Config.SafetyMaxTokens)
+	} else if spec.protocol == jsonResponse {
+		prepared, err = s.Ollama.PrepareModel(body)
+	} else {
+		prepared, err = s.Ollama.PrepareNative(body, stream, s.Config.SafetyMaxTokens)
+	}
 	if err != nil {
 		s.noteFailure(r, "malformed_inference")
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -164,115 +215,192 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request, endpoint stri
 	ctx, cancel := context.WithTimeout(r.Context(), s.Config.RequestTimeout)
 	defer cancel()
 	started := time.Now()
-	tracker := s.Meter.Tracker(hash, u.BalanceMicroUSDC, started)
-	var lastRaw []byte
-	partial := false
-	if stream {
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		flush, _ := w.(http.Flusher)
-		wrote := false
-		result, streamErr := s.Ollama.Stream(ctx, endpoint, prepared, func(raw []byte, event ollama.Event) error {
-			if err := tracker.Observe(event); err != nil {
-				if errors.Is(err, ollama.ErrStopped) {
-					partial = true
-					_, _ = w.Write(append(raw, '\n'))
-					wrote = true
-					if flush != nil {
-						flush.Flush()
-					}
-				}
-				return err
-			}
-			_, err := w.Write(append(raw, '\n'))
-			wrote = true
-			if flush != nil {
-				flush.Flush()
-			}
-			return err
-		})
-		if streamErr != nil {
-			s.Logger.Error("inference stream failed", "error", streamErr, "key", hash)
-			if !wrote {
-				writeError(w, http.StatusBadGateway, streamErr.Error())
-				return
-			}
-			partial = true
-			metadata, _ := json.Marshal(map[string]any{"done": true, "done_reason": "upstream_error", "partial": true})
-			_, _ = w.Write(append(metadata, '\n'))
-			if flush != nil {
-				flush.Flush()
-			}
-			if _, _, billingErr := s.finishBilling(hash, tracker, result.Usage, partial); billingErr != nil {
-				s.Logger.Error("billing failed after failed stream", "error", billingErr, "key", hash)
-			}
-			return
-		}
-		if result.Stopped {
-			partial = true
-		}
-		lastRaw = nil
-		if partial {
-			metadata := map[string]any{"done": true, "done_reason": "balance_depleted", "partial": true, "top_up_required": true}
-			data, _ := json.Marshal(metadata)
-			_, _ = w.Write(append(data, '\n'))
-			if flush != nil {
-				flush.Flush()
-			}
-		}
-		if _, _, err := s.finishBilling(hash, tracker, result.Usage, partial); err != nil {
-			s.Logger.Error("billing failed after stream", "error", err, "key", hash)
-		}
+	reservedTokens := ollama.OutputLimit(prepared, s.Config.SafetyMaxTokens)
+	if spec.billInput {
+		// A tokenizer cannot produce more tokens than the bytes supplied to it.
+		// JSON overhead makes this deliberately conservative for embeddings.
+		reservedTokens = len(body)
+	}
+	tracker, err := s.Meter.Tracker(hash, u.BalanceMicroUSDC, started, reservedTokens)
+	if err != nil {
+		writeError(w, http.StatusPaymentRequired, "insufficient balance for requested inference limit")
 		return
 	}
-
-	result, streamErr := s.Ollama.Stream(ctx, endpoint, prepared, func(raw []byte, event ollama.Event) error {
-		lastRaw = append(lastRaw[:0], raw...)
-		return tracker.Observe(event)
-	})
-	if streamErr != nil {
-		_, _, _ = s.finishBilling(hash, tracker, result.Usage, true)
-		writeError(w, http.StatusBadGateway, streamErr.Error())
+	defer tracker.Cancel()
+	upstreamRequest := r.WithContext(ctx)
+	if spec.protocol == jsonResponse || !stream {
+		s.jsonInference(w, upstreamRequest, spec, prepared, tracker, hash, spec.billInput)
 		return
 	}
-	if result.Stopped {
-		partial = true
-	}
-	if _, _, err := s.finishBilling(hash, tracker, result.Usage, partial); err != nil {
-		writeError(w, http.StatusInternalServerError, "unable to record usage")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if len(lastRaw) == 0 {
-		writeError(w, http.StatusBadGateway, "Ollama returned no response")
-		return
-	}
-	_, _ = w.Write(lastRaw)
+	s.streamInference(w, upstreamRequest, spec, prepared, tracker, hash)
 }
 
-func (s *Server) finishBilling(key string, tracker *meter.Tracker, usage ollama.Event, partial bool) (int64, int64, error) {
+func (s *Server) streamInference(w http.ResponseWriter, r *http.Request, spec inferenceSpec, body []byte, tracker *meter.Tracker, hash string) {
+	resp, err := s.Ollama.Do(r.Context(), r, spec.endpoint, body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		forwardResponse(w, resp)
+		return
+	}
+	copyResponseHeaders(w.Header(), resp.Header, false)
+	flush, _ := w.(http.Flusher)
+	wrote := false
+	callback := func(raw []byte, event ollama.Event) error {
+		n, err := w.Write(raw)
+		wrote = wrote || n > 0
+		if err == nil && n != len(raw) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			return err
+		}
+		tracker.Observe(event)
+		if flush != nil {
+			flush.Flush()
+		}
+		return nil
+	}
+	var result ollama.Result
+	var streamErr error
+	if spec.protocol == nativeNDJSON {
+		result, streamErr = s.Ollama.StreamNDJSON(resp.Body, callback)
+	} else {
+		result, streamErr = s.Ollama.StreamSSE(resp.Body, callback)
+	}
+	if streamErr != nil {
+		s.Logger.Error("inference stream failed", "error", streamErr, "key", hash)
+		if !wrote {
+			writeError(w, http.StatusBadGateway, streamErr.Error())
+			return
+		}
+	}
+	if _, _, err := s.finishBilling(tracker, result.Usage, streamErr != nil, spec.billInput); err != nil {
+		s.Logger.Error("billing failed after stream", "error", err, "key", hash)
+	}
+}
+
+func (s *Server) jsonInference(w http.ResponseWriter, r *http.Request, spec inferenceSpec, body []byte, tracker *meter.Tracker, hash string, billInput bool) {
+	resp, err := s.Ollama.Do(r.Context(), r, spec.endpoint, body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		forwardResponse(w, resp)
+		return
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "unable to read Ollama response")
+		return
+	}
+	event := ollama.EventFromJSON(data)
+	event.Done = true
+	tracker.Observe(event)
+	if _, _, err := s.finishBilling(tracker, event, false, billInput); err != nil {
+		if errors.Is(err, ledger.ErrInsufficientFunds) {
+			writeError(w, http.StatusPaymentRequired, "insufficient balance for completed inference")
+		} else {
+			writeError(w, http.StatusInternalServerError, "unable to record usage")
+		}
+		return
+	}
+	copyResponseHeaders(w.Header(), resp.Header, true)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
+	if !isOllamaPath(r.URL.Path) {
+		writeError(w, http.StatusNotFound, "route not found")
+		return
+	}
+	if spec, ok := classifyInference(r.Method, r.URL.Path); ok {
+		s.inference(w, r, spec)
+		return
+	}
+	u, hash, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	release, acquired := s.Limits.Acquire(r.Context(), hash, guardrails.Limits{RatePerMinute: u.RateLimitPerMin, Concurrency: u.ConcurrencyLimit})
+	if !acquired {
+		writeError(w, http.StatusTooManyRequests, "request cancelled while waiting for a capacity slot")
+		return
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(r.Context(), s.Config.RequestTimeout)
+	defer cancel()
+	request := r.WithContext(ctx)
+	s.Proxy.ServeHTTP(w, request)
+}
+
+func (s *Server) proxyError(w http.ResponseWriter, _ *http.Request, err error) {
+	s.Logger.Error("Ollama proxy failed", "error", err)
+	writeError(w, http.StatusBadGateway, "Ollama proxy request failed")
+}
+
+func isOllamaPath(path string) bool {
+	return path == "/" || path == "/api" || path == "/v1" || strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/v1/")
+}
+
+func forwardResponse(w http.ResponseWriter, resp *http.Response) {
+	copyResponseHeaders(w.Header(), resp.Header, true)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func copyResponseHeaders(dst, src http.Header, contentLength bool) {
+	headers := src.Clone()
+	for _, name := range strings.Split(headers.Get("Connection"), ",") {
+		headers.Del(strings.TrimSpace(name))
+	}
+	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		headers.Del(name)
+	}
+	if !contentLength {
+		headers.Del("Content-Length")
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func (s *Server) finishBilling(tracker *meter.Tracker, usage ollama.Event, partial, billInput bool) (int64, int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if billInput {
+		return tracker.FinalizeInput(ctx, usage, partial)
+	}
 	return tracker.Finalize(ctx, usage, partial)
 }
 
-func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+func (s *Server) user(w http.ResponseWriter, r *http.Request) (domain.User, string, bool) {
 	key, err := auth.FromRequest(r)
 	if err != nil {
 		s.noteFailure(r, "authentication")
 		writeError(w, http.StatusUnauthorized, "API key required")
-		return "", "", false
+		return domain.User{}, "", false
 	}
 	hash := auth.Hash(key)
-	if _, err := s.Store.GetUser(r.Context(), hash); err != nil {
+	u, err := s.Store.GetUser(r.Context(), hash)
+	if err != nil {
 		s.noteFailure(r, "authentication")
 		if errors.Is(err, ledger.ErrRevoked) || errors.Is(err, ledger.ErrNotFound) {
 			writeError(w, http.StatusUnauthorized, "invalid API key")
 		} else {
 			writeStoreError(w, err)
 		}
-		return "", "", false
+		return domain.User{}, "", false
 	}
-	return key, hash, true
+	return u, hash, true
 }
 
 func (s *Server) noteFailure(r *http.Request, reason string) {
@@ -296,7 +424,8 @@ func requestLogging(next http.Handler, logger *slog.Logger) http.Handler {
 
 type contextWriter struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
 func (w *contextWriter) Flush() {
@@ -306,9 +435,22 @@ func (w *contextWriter) Flush() {
 }
 
 func (w *contextWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
 	w.status = status
+	w.wroteHeader = true
 	w.ResponseWriter.WriteHeader(status)
 }
+
+func (w *contextWriter) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *contextWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, target any, max int64) error {
 	body, err := readBody(w, r, max)
