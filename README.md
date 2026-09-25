@@ -1,5 +1,7 @@
 # Paid LLM Inference Gateway
 
+![Paid LLM Inference Gateway](assets/payment-gateway.png)
+
 This is a single Go binary that fronts an entire Ollama HTTP API with invite-only
 API keys, prepaid USDC balances, usage metering, and per-key abuse controls.
 
