@@ -2,6 +2,8 @@
 
 <p align="center"><img src="assets/payment-gateway.png" alt="Paid LLM Inference Gateway" width="50%"></p>
 
+![Work in Progress](https://shields.io)
+
 This is a single Go binary that fronts an entire Ollama HTTP API with invite-only
 API keys, prepaid USDC balances, usage metering, and per-key abuse controls.
 
